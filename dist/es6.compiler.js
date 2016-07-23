@@ -1,6 +1,6 @@
 /**
  * Compiler for riot custom tags
- * @version v2.5.2
+ * @version WIP
  */
 
 import { brackets } from 'riot-tmpl'
@@ -137,6 +137,11 @@ var parsers = (function (win) {
 
 var extend = parsers.utils.extend
 /* eslint-enable */
+
+var SOURCE_MAP = typeof process !== 'undefined' && process.env.RIOTJS_SOURCE_MAP !== 'off'
+debug('SOURCE_MAP support is', SOURCE_MAP)
+
+var SOURCE_OFFSET = 2
 
 var S_LINESTR = /"[^"\n\\]*(?:\\[\S\s][^"\n\\]*)*"|'[^'\n\\]*(?:\\[\S\s][^'\n\\]*)*'/.source
 
@@ -390,10 +395,22 @@ function riotjs (js) {
 function _compileJS (js, opts, type, parserOpts, url) {
   if (!/\S/.test(js)) return ''
   if (!type) type = opts.type
+  debug('_compileJS', type, url)
 
   var parser = opts.parser || type && parsers._req('js.' + type, true) || riotjs
+  var parsed = parser(js, parserOpts, url, opts.sourceMap)
+  if (opts.sourceMap) {
 
-  return parser(js, parserOpts, url).replace(/\r\n?/g, '\n').replace(TRIM_TRAIL, '')
+    if (parsed.map) {
+      opts.sourceMap.addSourceChunk(parsed.code, parsed.map, opts.sourcePosition || 0)
+    } else if (typeof parsed === 'string') {
+      var map = devtools.parseInlineSourceMap(parsed)
+      if (map) opts.sourceMap.addSourceChunk(parsed, map, opts.sourcePosition || 0)
+    }
+  }
+  var code = typeof parsed === 'string' ? parsed : parsed.code
+  code = code.replace(/\r\n?/g, '\n').replace(TRIM_TRAIL, '')
+  return code
 }
 
 function compileJS (js, opts, type, userOpts) {
@@ -494,10 +511,14 @@ function mktag (name, html, css, attr, js, imports, opts) {
 
   if (js && js.slice(-1) !== '\n') s = '\n' + s
 
-  return imports + 'riot.tag2(\'' + name + SQ +
+  var header = imports + 'riot.tag2(\'' + name + SQ +
     c + _q(html, 1) +
     c + _q(css) +
-    c + _q(attr) + ', function(opts) {\n' + js + s
+    c + _q(attr) + ', function(opts) {\n'
+  debug('tag header lines', lineCount(header))
+  var code = header + js + s
+  if (opts.sourceMap) code += opts.sourceMap.toComment()
+  return code
 }
 
 function splitBlocks (str) {
@@ -594,6 +615,10 @@ function compileTemplate (html, url, lang, opts) {
   return parser(html, opts, url)
 }
 
+function lineCount (content) {
+  return (content || '').split('\n').length
+}
+
 var
 
   CUST_TAG = RegExp(/^([ \t]*)<(-?[A-Za-z][-\w\xA0-\xFF]*)(?:\s+([^'"\/>]+(?:(?:@|\/[^>])[^'"\/>]*)*)|\s*)?(?:\/>|>[ \t]*\n?([\S\s]*)^\1<\/\2\s*>|>(.*)<\/\2\s*>)/
@@ -613,8 +638,12 @@ function compile (src, opts, url) {
       js: {},
       style: {}
     }
-
-  if (!opts) opts = {}
+  var srcFile = url && path.basename(url) || '<unknown>'
+  opts = extend({}, opts || {})
+  var offset = opts.sourceOffset || SOURCE_OFFSET
+  if (SOURCE_MAP && !opts.sourceMap) {
+    opts.sourceMap = new devtools.SourceMap(src, srcFile, offset)
+  }
 
   opts.parserOptions = extend(defaultParserptions, opts.parserOptions || {})
 
@@ -630,7 +659,7 @@ function compile (src, opts, url) {
   }
 
   src = cleanSource(src)
-    .replace(CUST_TAG, function (_, indent, tagName, attribs, body, body2) {
+    .replace(CUST_TAG, function (_, indent, tagName, attribs, body, body2, tagOffset) {
       var
         jscode = '',
         styles = '',
@@ -641,6 +670,8 @@ function compile (src, opts, url) {
       pcex._bp = _bp
 
       tagName = tagName.toLowerCase()
+      var bodyPosition = lineCount(src.slice(0, tagOffset)) + lineCount(attribs)
+      debug('custom tag', tagName, bodyPosition)
 
       attribs = attribs && included('attribs')
         ? restoreExpr(
@@ -658,18 +689,22 @@ function compile (src, opts, url) {
 
           body = body.replace(RegExp('^' + indent, 'gm'), '')
 
-          body = body.replace(STYLES, function (_m, _attrs, _style) {
-            if (included('css')) {
-              styles += (styles ? ' ' : '') + cssCode(_style, opts, _attrs, url, tagName)
+          body = body.replace(SCRIPTS, function (_m, _attrs, _script, scriptOffset) {
+            debug('replace scripts', bodyPosition, scriptOffset, _attrs)
+            if (included('js')) {
+              var before = body.slice(0, scriptOffset)
+              debug('script before', lineCount(before))
+              opts.sourcePosition = bodyPosition + lineCount(before)
+              var code = getCode(_script, opts, _attrs, url)
+              if (code) jscode += (jscode ? '\n' : '') + code
             }
             return ''
           })
 
-          body = body.replace(SCRIPTS, function (_m, _attrs, _script) {
-            if (included('js')) {
-              var code = getCode(_script, opts, _attrs, url)
+          body = body.replace(STYLES, function (_m, _attrs, _style) {
 
-              if (code) jscode += (jscode ? '\n' : '') + code
+            if (included('css')) {
+              styles += (styles ? ' ' : '') + cssCode(_style, opts, _attrs, url, tagName)
             }
             return ''
           })
@@ -679,17 +714,17 @@ function compile (src, opts, url) {
           if (included('html')) {
             html = _compileHTML(blocks[0], opts, pcex)
           }
+          debug('core blocks', blocks[0].length, blocks[1].length)
 
           if (included('js')) {
+            opts.sourcePosition = bodyPosition + lineCount(blocks[0])
             body = _compileJS(blocks[1], opts, null, null, url)
             imports = compileImports(jscode)
-            jscode  = rmImports(jscode)
+            jscode = rmImports(jscode)
             if (body) jscode += (jscode ? '\n' : '') + body
           }
         }
       }
-
-      jscode = /\S/.test(jscode) ? jscode.replace(/\n{3,}/g, '\n\n') : ''
 
       if (opts.entities) {
         parts.push({
@@ -710,7 +745,7 @@ function compile (src, opts, url) {
   return src
 }
 
-var version = 'v2.5.2'
+var version = 'WIP'
 
 export default {
   compile,

@@ -9,10 +9,12 @@
  */
 'use strict'
 
+var debug = require('debug')('compiler:core')
 var brackets  = require('./brackets')
 var parsers   = require('./parsers')
 var safeRegex = require('./safe-regex')
 var path      = require('path')           // used by getCode()
+var devtools  = require('./devtools')
 //#endif
 
 /*#if NODE
@@ -23,6 +25,21 @@ var extend = parsers.utils.extend
 //#endif
 /* eslint-enable */
 
+var SOURCE_MAP = typeof process !== 'undefined' && process.env.RIOTJS_SOURCE_MAP !== 'off'
+debug('SOURCE_MAP support is', SOURCE_MAP)
+
+/**
+   By default 2 lines are added to the compiled tags code:
+   var riot = require('riot')
+   riot.tag2('tag-name', '<html>', function (opts) {
+
+   These lines are added after sourcemap generation, so we adjust
+   source map offset in advance.
+
+   If the conusmer of compiled Riot tags need different offset, it
+   should be passed as `compiler.compile(code, {sourceOffset: 3}, url)`.
+*/
+var SOURCE_OFFSET = 2
 //#set $_RIX_TEST = 4
 //#ifndef $_RIX_TEST
 var $_RIX_TEST = 4
@@ -488,11 +505,23 @@ function riotjs (js) {
 function _compileJS (js, opts, type, parserOpts, url) {
   if (!/\S/.test(js)) return ''
   if (!type) type = opts.type
-
+  debug('_compileJS', type, url)
   // 2016-05-11: _req throws exception for invalid parser
   var parser = opts.parser || type && parsers._req('js.' + type, true) || riotjs
-
-  return parser(js, parserOpts, url).replace(/\r\n?/g, '\n').replace(TRIM_TRAIL, '')
+  var parsed = parser(js, parserOpts, url, opts.sourceMap)
+  if (opts.sourceMap) {
+    // if chunk's source map is available use it, otherwise attemp to
+    // parse inline source map
+    if (parsed.map) {
+      opts.sourceMap.addSourceChunk(parsed.code, parsed.map, opts.sourcePosition || 0)
+    } else if (typeof parsed === 'string') {
+      var map = devtools.parseInlineSourceMap(parsed)
+      if (map) opts.sourceMap.addSourceChunk(parsed, map, opts.sourcePosition || 0)
+    }
+  }
+  var code = typeof parsed === 'string' ? parsed : parsed.code
+  code = code.replace(/\r\n?/g, '\n').replace(TRIM_TRAIL, '')
+  return code
 }
 
 /**
@@ -741,10 +770,14 @@ function mktag (name, html, css, attr, js, imports, opts) {
   if (js && js.slice(-1) !== '\n') s = '\n' + s
 
   // 2016-01-18: html can contain eols if opts.whitespace=1, fix with q(s,1)
-  return imports + 'riot.tag2(\'' + name + SQ +
+  var header = imports + 'riot.tag2(\'' + name + SQ +
     c + _q(html, 1) +
     c + _q(css) +
-    c + _q(attr) + ', function(opts) {\n' + js + s
+    c + _q(attr) + ', function(opts) {\n'
+  debug('tag header lines', lineCount(header))
+  var code = header + js + s
+  if (opts.sourceMap) code += opts.sourceMap.toComment()
+  return code
 }
 
 /**
@@ -918,6 +951,10 @@ function compileTemplate (html, url, lang, opts) {
   return parser(html, opts, url)
 }
 
+function lineCount (content) {
+  return (content || '').split('\n').length
+}
+
 /*
   ## The main compiler
   -----------------------------------------------------------------------------
@@ -984,9 +1021,12 @@ function compile (src, opts, url) {
       js: {},
       style: {}
     }
-
-  if (!opts) opts = {}
-
+  var srcFile = url && path.basename(url) || '<unknown>'
+  opts = extend({}, opts || {}) // avoid side-effects in external code
+  var offset = opts.sourceOffset || SOURCE_OFFSET
+  if (SOURCE_MAP && !opts.sourceMap) {
+    opts.sourceMap = new devtools.SourceMap(src, srcFile, offset)
+  }
   // make sure the custom parser options are always objects
   opts.parserOptions = extend(defaultParserptions, opts.parserOptions || {})
 
@@ -1010,11 +1050,10 @@ function compile (src, opts, url) {
   if (opts.template) {
     src = compileTemplate(src, url, opts.template, opts.parserOptions.template)
   }
-
   // each tag can have attributes first, then html markup with zero or more script
   // or style tags of different types, and finish with the untagged JS block.
   src = cleanSource(src)
-    .replace(CUST_TAG, function (_, indent, tagName, attribs, body, body2) {
+    .replace(CUST_TAG, function (_, indent, tagName, attribs, body, body2, tagOffset) {
       var
         jscode = '',
         styles = '',
@@ -1025,7 +1064,8 @@ function compile (src, opts, url) {
       pcex._bp = _bp
 
       tagName = tagName.toLowerCase()
-
+      var bodyPosition = lineCount(src.slice(0, tagOffset)) + lineCount(attribs)
+      debug('custom tag', tagName, bodyPosition)
       // process the attributes, including their expressions
       attribs = attribs && included('attribs')
         ? restoreExpr(
@@ -1045,23 +1085,27 @@ function compile (src, opts, url) {
           // remove tag indentation in the content
           body = body.replace(RegExp('^' + indent, 'gm'), '')
 
-          // get and process the style blocks
-          body = body.replace(STYLES, function (_m, _attrs, _style) {
-            if (included('css')) {
-              styles += (styles ? ' ' : '') + cssCode(_style, opts, _attrs, url, tagName)
-            }
-            return ''
-          })
-
           // now the script blocks
-          body = body.replace(SCRIPTS, function (_m, _attrs, _script) {
+          body = body.replace(SCRIPTS, function (_m, _attrs, _script, scriptOffset) {
+            debug('replace scripts', bodyPosition, scriptOffset, _attrs)
             if (included('js')) {
+              var before = body.slice(0, scriptOffset)
+              debug('script before', lineCount(before))
+              opts.sourcePosition = bodyPosition + lineCount(before)
               var code = getCode(_script, opts, _attrs, url)
-
               //#if NODE
               if (code === false) return _m.replace(DEFER_ATTR, '')
               //#endif
               if (code) jscode += (jscode ? '\n' : '') + code
+            }
+            return ''
+          })
+
+          // get and process the style blocks
+          body = body.replace(STYLES, function (_m, _attrs, _style) {
+
+            if (included('css')) {
+              styles += (styles ? ' ' : '') + cssCode(_style, opts, _attrs, url, tagName)
             }
             return ''
           })
@@ -1073,19 +1117,17 @@ function compile (src, opts, url) {
           if (included('html')) {
             html = _compileHTML(blocks[0], opts, pcex)
           }
-
+          debug('core blocks', blocks[0].length, blocks[1].length)
           // and the untagged js block
           if (included('js')) {
+            opts.sourcePosition = bodyPosition + lineCount(blocks[0])
             body = _compileJS(blocks[1], opts, null, null, url)
             imports = compileImports(jscode)
-            jscode  = rmImports(jscode)
+            jscode = rmImports(jscode)
             if (body) jscode += (jscode ? '\n' : '') + body
           }
         }
       }
-
-      // give more consistency to the output
-      jscode = /\S/.test(jscode) ? jscode.replace(/\n{3,}/g, '\n\n') : ''
 
       // if "entities" option, add as an object in the array "parts"
       if (opts.entities) {
